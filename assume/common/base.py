@@ -881,6 +881,186 @@ class OnPolicyConfig(AlgorithmConfig):
     actor_architecture: str = "mlp"
 
 
+# PARAMETER-SHARING
+# component 1: configuration contract. This dataclass describes parameter-sharing choices. Its only responsibility is to parse and validate configuration.
+@dataclass
+class ParameterSharingConfig:
+    """
+    Configuration for parameter sharing among RL units.
+
+    Parameters:
+        enabled (bool):
+            master switch which when False, the assume-framework preserves the original one-actor and one-critic per unit behavior.
+
+        actor_mode:
+            "independent": one actor per unit.
+            "full": one actor for every compatible unit.
+            "grouped" one actor per sharing group.
+
+        critic_mode:
+            "independent": one critic per unit.
+            "full": one critic for every compatible unit.
+            "grouped": one critic per group.
+            "shared_trunk": shared feature layers with separate output heads.
+            "context_conditioned": one critic receives the selected unit's identity or semantic context.
+
+        grouping_method:
+            "individual": every unit forms its own group.
+            "all": all compatible units form one group.
+            "manual": group assignments come from unit_to_group.
+            "semantic": groups are based on metadata such as technology.
+            "kmeans_context": K-means groups semantic context vectors.
+            "learned_embedding': learned embeddings are clustered.
+            "dynamic_quantile": membership depends on a changing quantity.
+
+        conditioning_method:
+            "none": actor receives only its normal observation.
+            "one_hot_unit_id": append a unique one-hot unit identity.
+            "semantic_context": append meaningful unit properties.
+            "learned_embedding": append a learned unit representation.
+            "unit_id_and_context": append identity and semantic context.
+
+        context_architecture:
+            "concatenation": directly concatenate observation and context.
+            "late_fusion": encode them separately and combine later.
+            "film": context modulates hidden features.
+
+        loss_aggregation:
+            how member losses update one shared network.
+            "mean": average all member losses.
+            "sum": add all member losses.
+            "weighted_mean": calculate a weighted average, which is useful when some units are more important, rare or contribute unequal amounts of experience.
+            "gradnorm": gives more or less importance to each unit's loss so all units learn at a balanced speed.
+            "pcgrad": changes conflicting unit gradients so one unit's learning update does not directly harm another unit.
+            "cagrad": combines gradients so the shared update helps the group overall while avoiding severely harming any individual units.
+
+        unit_to_group:
+            explicit mapping used when grouping_method is "manual".
+
+        context_features:
+            ordered semantic properties supplied to contextual networks.
+
+        n_clusters:
+            number of clusters for clustering-based grouping.
+
+        max_group_size:
+            optional upper bound on the number of units sharing a network.
+    """
+    enabled: bool = False
+
+    actor_mode: str = "independent"
+    critic_mode: str = "independent"
+
+    grouping_method: str = "individual"
+    conditioning_method: str = "none"
+    context_architecture: str = "concatenation"
+    loss_aggregation: str = "mean"
+
+    unit_to_group: dict[str, str] = field(
+        default_factory = dict
+    )
+    context_features: list[str] = field(
+        default_factory = list
+    )
+
+    n_clusters: int | None = None
+    max_group_size: int | None = None
+
+    def __post_init__(self) -> None:
+        """validate configuration values without changing network behavior."""
+        valid_actor_modes = {"independent", "full", "grouped"}
+        valid_critic_modes = {
+            "independent",
+            "full",
+            "grouped",
+            "shared_trunk",
+            "context_conditioned",
+        }
+        valid_grouping_methods = {
+            "individual",
+            "all",
+            "manual",
+            "semantic",
+            "kmeans_context",
+            "learned_embedding",
+            "dynamic_quantile",
+        }
+        valid_conditioning_methods = {
+            "none",
+            "one_hot_unit_id",
+            "semantic_context",
+            "learned_embedding",
+            "unit_id_and_context",
+        }
+        valid_context_architectures = {
+            "concatenation",
+            "late_fusion",
+            "film",
+        }
+        valid_loss_aggregations = {
+            "mean",
+            "sum",
+            "weighted_mean",
+            "gradnorm",
+            "pcgrad",
+            "cagrad",
+        }
+        self._validate_choice(
+            "actor_mode",
+            self.actor_mode,
+            valid_actor_modes
+        )
+        self._validate_choice(
+            "critic_mode",
+            self.critic_mode,
+            valid_critic_modes
+        )
+        self._validate_choice(
+            "grouping_method",
+            self.grouping_method,
+            valid_grouping_methods
+        )
+        self._validate_choice(
+            "conditioning_method",
+            self.conditioning_method,
+            valid_conditioning_methods
+        )
+        self._validate_choice(
+            "context_architecture",
+            self.context_architecture,
+            valid_context_architectures
+        )
+        self._validate_choice(
+            "loss_aggregation",
+            self.loss_aggregation,
+            valid_loss_aggregations
+        )
+
+        if self.n_clusters is not None and self.n_clusters < 1:
+            raise ValueError("n_clusters must be at least 1")
+
+        if self.max_group_size is not None and self.max_group_size < 1:
+            raise ValueError("max_group_size must be at least 1")
+
+        if self.grouping_method == "manual" and not self.unit_to_group:
+            raise ValueError(
+                "unit_to_group must be provided when grouping_method='manual'"
+            )
+
+    @staticmethod
+    def _validate_choice(
+        field_name: str,
+        value: str,
+        valid_values: set[str]
+    ) -> None:
+        """Raise a useful error for an unsupported configuration value."""
+        if value not in valid_values:
+            supported = ", ".join(sorted(valid_values))
+            raise ValueError(
+                f"Invalid {field_name}='{value}'. "
+                f"Supported values: {supported}"
+            )
+
 @dataclass
 class LearningConfig:
     """
@@ -967,6 +1147,12 @@ class LearningConfig:
     off_policy: OffPolicyConfig = field(default_factory=OffPolicyConfig)
     on_policy: OnPolicyConfig = field(default_factory=OnPolicyConfig)
 
+    # PARAMETER-SHARING
+    # component 1: every learning configuration should now contains a parameter-sharing configuration. its defaults preserve the existing independent behavior.
+    parameter_sharing: ParameterSharingConfig = field(
+        default_factory = ParameterSharingConfig
+    )
+
     def __post_init__(self):
         """Calculate defaults that depend on other fields and validate inputs."""
         # Convert nested dicts to dataclass instances if necessary
@@ -974,6 +1160,12 @@ class LearningConfig:
             self.off_policy = OffPolicyConfig(**self.off_policy)
         if isinstance(self.on_policy, dict):
             self.on_policy = OnPolicyConfig(**self.on_policy)
+        # PARAMETER-SHARING
+        # component 1: Converting that dictionary into a typed validated ParameterSharingConfig object.
+        if isinstance(self.parameter_sharing, dict):
+            self.parameter_sharing = ParameterSharingConfig(
+                **self.parameter_sharing
+            )
 
         for config in [self.off_policy, self.on_policy]:
             if config:

@@ -15,14 +15,14 @@ base:
     trained_policies_save_path: null
     trained_policies_load_path: null
     max_bid_price: 100
-    algorithm: matd3
+    algorithm: mappo
     learning_rate: 0.001
-    training_episodes: 150
-    train_freq: 100h
+    training_episodes: 8
+    train_freq: 24h
     batch_size: 128
     gamma: 0.99
     device: cpu
-    validation_episodes_interval: 5
+    validation_episodes_interval: 2
 
     # Off-policy parameters (required for TD3/DDPG algorithms)
     off_policy:
@@ -41,6 +41,21 @@ base:
       vf_coef: 0.5
       gae_lambda: 0.95
       n_epochs: 25
+
+    # PARAMETER-SHARING
+    # component 1: configuration parsing.
+    parameter_sharing:
+      enabled: false
+      actor_mode: independent
+      critic_mode: independent
+      grouping_method: individual
+      conditioning_method: none
+      context_architecture: concatenation
+      loss_aggregation: mean
+      unit_to_group: {}
+      context_features: []
+      n_clusters: null
+      max_group_size: null
 
   markets_config:
     EOM:
@@ -74,18 +89,18 @@ base_lstm:
     algorithm: matd3
     actor_architecture: lstm
     learning_rate: 0.001
-    training_episodes: 30
+    training_episodes: 8
     train_freq: 24h
     batch_size: 256
     gamma: 0.99
     device: cpu
-    validation_episodes_interval: 5
+    validation_episodes_interval: 2
     early_stopping_steps: 10
     early_stopping_threshold: 0.05
 
     # Off-policy parameters (required for TD3/DDPG algorithms)
     off_policy:
-      episodes_collecting_initial_experience: 3
+      episodes_collecting_initial_experience: 1
       gradient_steps: 1
       noise_sigma: 0.1
       noise_scale: 1
@@ -99,6 +114,21 @@ base_lstm:
       vf_coef: 0.5
       gae_lambda: 0.95
       n_epochs: 25
+
+    # PARAMETER-SHARING
+    # component 1: configuration parsing.
+    parameter_sharing:
+      enabled: false
+      actor_mode: independent
+      critic_mode: independent
+      grouping_method: individual
+      conditioning_method: none
+      context_architecture: concatenation
+      loss_aggregation: mean
+      unit_to_group: {}
+      context_features: []
+      n_clusters: null
+      max_group_size: null
 
   markets_config:
     EOM:
