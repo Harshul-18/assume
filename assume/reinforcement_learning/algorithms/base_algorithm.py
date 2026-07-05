@@ -13,6 +13,10 @@ from assume.reinforcement_learning.algorithms import actor_architecture_aliases
 from assume.reinforcement_learning.learning_utils import (
     transfer_weights,
 )
+from assume.reinforcement_learning.parameter_sharing import (
+    NetworkGroupRegistry,
+    build_group_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +172,31 @@ class RLAlgorithm:
         Note:
             This is an abstract method that must be overridden by subclasses.
         """
+
+    # PARAMETER-SHARING
+    # component 2: grouping
+    def build_parameter_sharing_groups(self) -> None:
+        """Build actor and critic group mappings for registered strategies."""
+        config = self.learning_config.parameter_sharing
+        strategies = self.learning_role.rl_strats
+
+        self.actor_group_registry: NetworkGroupRegistry = build_group_registry(
+            strategies = strategies,
+            mode = config.actor_mode,
+            config = config,
+            network_name = "actor"
+        )
+
+        self.critic_group_registry: NetworkGroupRegistry = build_group_registry(
+            strategies = strategies,
+            mode = config.critic_mode,
+            config = config,
+            network_name = "critic"
+        )
+
+        # exposing the registries through the Learning Role for diagnostics.
+        self.learning_role.actor_group_registry = self.actor_group_registry
+        self.learning_role.critic_group_registry = self.critic_group_registry
 
 
 class A2CAlgorithm(RLAlgorithm):
@@ -479,6 +508,10 @@ class A2CAlgorithm(RLAlgorithm):
             >>> # Assign existing networks
             >>> algorithm.initialize_policy(existing_networks_dict)
         """
+        # PARAMETER-SHARING
+        # component 2: grouping
+        self.build_parameter_sharing_groups()
+
         if actors_and_critics is None:
             self.check_strategy_dimensions()
             self.create_actors()

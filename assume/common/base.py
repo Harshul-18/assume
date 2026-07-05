@@ -910,8 +910,11 @@ class ParameterSharingConfig:
             "manual": group assignments come from unit_to_group.
             "semantic": groups are based on metadata such as technology.
             "kmeans_context": K-means groups semantic context vectors.
-            "learned_embedding': learned embeddings are clustered.
+            "learned_embedding": learned embeddings are clustered.
             "dynamic_quantile": membership depends on a changing quantity.
+
+        grouping_feature:
+            metadata field used when grouping_method="semantic". For example "technology" groups gas units together, wind units together, and storage units together.
 
         conditioning_method:
             "none": actor receives only its normal observation.
@@ -952,6 +955,7 @@ class ParameterSharingConfig:
     critic_mode: str = "independent"
 
     grouping_method: str = "individual"
+    grouping_feature: str = "technology"
     conditioning_method: str = "none"
     context_architecture: str = "concatenation"
     loss_aggregation: str = "mean"
@@ -1005,6 +1009,18 @@ class ParameterSharingConfig:
             "pcgrad",
             "cagrad",
         }
+        # PARAMETER-SHARING
+        # component 2: grouping
+        if (
+            self.grouping_method == "semantic"
+            and (
+                not isinstance(self.grouping_feature, str)
+                or not self.grouping_feature.strip()
+            )
+        ):
+            raise ValueError(
+                "grouping_feature must be a non-empty string when grouping_method='semantic'"
+            )
         self._validate_choice(
             "actor_mode",
             self.actor_mode,
@@ -1235,6 +1251,12 @@ class LearningStrategy(BaseStrategy):
         # defines the number of provided timeseries, this is necessary for correctly splitting
         # them into suitable format for recurrent neural networks
         self.num_timeseries_obs_dim = num_timeseries_obs_dim
+
+        # PARAMETER-SHARING
+        # component 2: grouping
+        # Semantic properties used for parameter-sharing group construction.
+        # World populates this after constructing the corresponding unit.
+        self.sharing_metadata: dict[str, object] = {}
 
         self.obs_dim = num_timeseries_obs_dim * foresight + unique_obs_dim
 

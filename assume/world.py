@@ -516,12 +516,25 @@ class World:
         unit_params["bidding_strategies"] = bidding_strategies
 
         # create unit within the unit operator its associated with
-        return unit_class(
-            id=id,
-            unit_operator=unit_operator_id,
-            forecaster=forecaster,
-            **unit_params,
+
+        # PARAMETER-SHARING
+        # component 2: grouping
+        unit = unit_class(
+            id = id,
+            unit_operator = unit_operator_id,
+            forecaster = forecaster,
+            **unit_params
         )
+
+        # attaching stable semantic metadata after the complete unit exits, grouping construction happens later during policy initialization.
+        for strategy in set(bidding_strategies.values()):
+            if isinstance(strategy, LearningStrategy):
+                strategy.sharing_metadata = {
+                    **unit.as_dict(),
+                    "unit_type": unit_type,
+                }
+
+        return unit
 
     def _prepare_bidding_strategies(self, unit_params, unit_id):
         """
