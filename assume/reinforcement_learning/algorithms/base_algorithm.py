@@ -529,6 +529,9 @@ class A2CAlgorithm(RLAlgorithm):
             self.obs_dim = actors_and_critics["obs_dim"]
             self.act_dim = actors_and_critics["act_dim"]
             self.unique_obs_dim = actors_and_critics["unique_obs_dim"]
+            # PARMETER-SHARING
+            # component 3: group architecture
+            self.index_existing_group_actors()
 
     def check_strategy_dimensions(self) -> None:
         """Validate learning strategy dimensions.
@@ -601,7 +604,7 @@ class A2CAlgorithm(RLAlgorithm):
             self.obs_dim = obs_dim_list[0]
 
     def create_actors(self) -> None:
-        """Create actor networks for all learning strategies.
+        """Create oen actor, target actor and optimizer per actor group.
 
         This method initializes actor networks and their corresponding target networks for
         each registered unit strategy. Actors map observations to actions.
@@ -615,36 +618,42 @@ class A2CAlgorithm(RLAlgorithm):
             >>> algorithm.create_actors()
             >>> # Creates actor and actor_target for each strategy
         """
+        # PARAMETER-SHARING
+        # component 3: group architecture
+        self.actors_by_group: dict[str, th.nn.Module] = {}
+        self.actor_targets_by_group: dict[str, th.nn.Module] = {}
+        self.actor_optimizers_by_group: dict[
+            str, th.optim.Optimizer
+        ] = {}
 
-        for strategy in self.learning_role.rl_strats.values():
-            strategy.actor = self.actor_architecture_class(
-                obs_dim=self.obs_dim,
-                act_dim=self.act_dim,
-                float_type=self.float_type,
-                unique_obs_dim=self.unique_obs_dim,
-                num_timeseries_obs_dim=self.num_timeseries_obs_dim,
-            ).to(self.device)
-
-            if self.uses_target_networks:
-                strategy.actor_target = self.actor_architecture_class(
-                    obs_dim=self.obs_dim,
-                    act_dim=self.act_dim,
-                    float_type=self.float_type,
-                    unique_obs_dim=self.unique_obs_dim,
-                    num_timeseries_obs_dim=self.num_timeseries_obs_dim,
-                ).to(self.device)
-
-                strategy.actor_target.load_state_dict(strategy.actor.state_dict())
-                strategy.actor_target.train(mode=False)
-
-            strategy.actor.optimizer = AdamW(
-                strategy.actor.parameters(),
-                lr=self.learning_role.calc_lr_from_progress(
-                    1
-                ),  # 1=100% of simulation remaining, uses learning_rate from config as starting point
+        for group_id, member_ids in (
+            self.actor_group_registry.groups.items()
+        ):
+            representative_id = member_ids[0]
+            representative = self.learning_role.rl_strats[
+                representative_id
+            ]
+            actor = self.create_actor_network(representative)
+            optimizer = AdamW(
+                actor.parameters(),
+                lr = self.learning_role.calc_lr_from_progress(1)
             )
-
-            strategy.actor.loaded = False
+            actor.optimizer = optimizer
+            actor.loaded = False
+            self.actors_by_group[group_id] = actor
+            self.actor_optimizers_by_group[group_id] = optimizer
+            actor_target = None
+            if self.uses_target_networks:
+                actor_target = self.create_actor_network(representative)
+                actor_target.load_state_dict(actor.state_dict())
+                actor_target.train(mode=False)
+                self.actor_targets_by_group[group_id] = actor_target
+            
+            for unit_id in member_ids:
+                strategy = self.learning_role.rl_strats[unit_id]
+                strategy.actor = actor
+                if self.uses_target_networks:
+                    strategy.actor_target = actor_target
 
     def create_critics(self) -> None:
         """Create critic networks for all learning strategies.
@@ -735,3 +744,49 @@ class A2CAlgorithm(RLAlgorithm):
             actors_and_critics["target_critics"] = target_critics
 
         return actors_and_critics
+
+    # PARAMETER-SHARING
+    # component 3: group architecture
+    def create_actor_network(
+        self,
+        strategy: LearningStrategy,
+    ) -> th.nn.Module:
+        """Construct one deterministic actor network."""
+
+        return self.actor_architecture_class(
+            obs_dim = self.obs_dim,
+            act_dim = self.act_dim,
+            float_type = self.float_type,
+            unique_obs_dim = self.unique_obs_dim,
+            num_timeseries_obs_dim = strategy.num_timeseries_obs_dim
+        ).to(self.device)
+
+    # PARMETER-SHARING
+    # component 3: group architecture
+    def index_existing_group_actors(self) -> None:
+        self.actors_by_group = {}
+        self.actor_targets_by_group = {}
+        self.actor_optimizers_by_group = {}
+
+        for group_id, member_ids in self.actor_group_registry.groups.items():
+            first_strategy = self.learning_role.rl_strats[member_ids[0]]
+            actor = first_strategy.actor
+            for unit_id in member_ids[1:]:
+                member_actor = self.learning_role.rl_strats[
+                    unit_id
+                ].actor
+                if member_actor is not actor:
+                    raise ValueError(
+                        f"Actor group '{group_id}' did not preserve shared object identity between episodes."
+                    )
+            self.actors_by_group[group_id] = actor
+            self.actor_optimizers_by_group[group_id] = actor.optimizer
+            if self.uses_target_networks:
+                target = first_strategy.actor_target
+                for unit_id in member_ids[1:]:
+                    member_target = self.learning_role.rl_strats[unit_id].actor_target
+                    if member_target is not target:
+                        raise ValueError(
+                            f"Actor target group '{group_id}' did not preserve shared object identity."
+                        )
+                self.actor_targets_by_group[group_id] = target

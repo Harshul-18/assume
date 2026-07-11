@@ -15,7 +15,7 @@ base:
     trained_policies_save_path: null
     trained_policies_load_path: null
     max_bid_price: 100
-    algorithm: maddpg
+    algorithm: mappo
     learning_rate: 0.001
     training_episodes: 8
     train_freq: 24h
@@ -46,9 +46,9 @@ base:
     # component 1: configuration parsing.
     # component 2: grouping
     parameter_sharing:
-      enabled: true
+      enabled: false
       actor_mode: grouped
-      critic_mode: grouped
+      critic_mode: independent
       grouping_method: semantic
       grouping_feature: fuel_type
       conditioning_method: none

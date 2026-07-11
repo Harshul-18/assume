@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+from assume.common.base import LearningStrategy
 import logging
 
 import numpy as np
@@ -126,7 +127,7 @@ class PPO(A2CAlgorithm):
         return action, noise
 
     def create_actors(self) -> None:
-        """Create stochastic actor networks for all agents.
+        """Create one stochastic actor network and optimizer per actor group.
 
         Initializes the ActorPPO or LSTMActorPPO network based on the configuration,
         as well as its optimizer for each agent strategy.
@@ -135,32 +136,9 @@ class PPO(A2CAlgorithm):
             >>> ppo.create_actors()
             >>> # Creates actor network and optimizer for each strategy
         """
-        actor_architecture = self.learning_config.on_policy.actor_architecture
-
-        for strategy in self.learning_role.rl_strats.values():
-            # Create PPO Actor
-            if actor_architecture == "lstm":
-                strategy.actor = LSTMActorPPO(
-                    obs_dim=self.obs_dim,
-                    act_dim=self.act_dim,
-                    float_type=self.float_type,
-                    unique_obs_dim=self.unique_obs_dim,
-                    num_timeseries_obs_dim=strategy.num_timeseries_obs_dim,
-                ).to(self.device)
-            else:
-                strategy.actor = ActorPPO(
-                    obs_dim=self.obs_dim,
-                    act_dim=self.act_dim,
-                    float_type=self.float_type,
-                ).to(self.device)
-
-            # Create Optimizer
-            strategy.actor.optimizer = AdamW(
-                strategy.actor.parameters(),
-                lr=self.learning_role.calc_lr_from_progress(1),
-            )
-
-            strategy.actor.loaded = False
+        # PARAMETER-SHARING
+        # component 3: group architecture
+        super().create_actors()
 
     def create_critics(self) -> None:
         """Create value networks for all agents.
@@ -519,3 +497,27 @@ class PPO(A2CAlgorithm):
             f"PPO update complete. Actor loss: {np.mean(all_actor_losses):.4f}, "
             f"Value loss: {np.mean(all_critic_losses):.4f}"
         )
+
+    # PARAMETER-SHARING
+    # component 3: group architecture
+    def create_actor_network(
+        self,
+        strategy: LearningStrategy
+    ) -> th.nn.Module:
+        """Construct a MAPPO stochastic actor network."""
+        actor_architecture = self.learning_config.on_policy.actor_architecture
+        if actor_architecture == "lstm":
+            return LSTMActorPPO(
+                obs_dim = self.obs_dim,
+                act_dim = self.act_dim,
+                float_type = self.float_type,
+                unique_obs_dim = self.unique_obs_dim,
+                num_timeseries_obs_dim = (
+                    strategy.num_timeseries_obs_dim
+                )
+            ).to(self.device)
+        return ActorPPO(
+            obs_dim = self.obs_dim,
+            act_dim = self.act_dim,
+            float_type = self.float_type
+        ).to(self.device)
