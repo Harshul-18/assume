@@ -144,15 +144,23 @@ class TD3(A2CAlgorithm):
             self.learning_role.get_progress_remaining()
         )
 
-        # loop over all units to avoid update call for every gradient step, as it will be ambiguous
+        # PARAMETER-SHARING
+        # component 4: loss aggregation
+        # critics remain independent, so one optimizer exists per strategy.
+        critic_optimizers = [
+            strategy.critics.optimizer for strategy in strategies
+        ]
+        self.update_learning_rate(
+            critic_optimizers,
+            learning_rate = learning_rate
+        )
+        # Actors are owned by groups, so update each unique optimizer once.
+        self.update_learning_rate(
+            list(self.actor_optimizers_by_group.values()),
+            learning_rate = learning_rate
+        )
+        # Exploration noise remains unit-specific.
         for strategy in strategies:
-            self.update_learning_rate(
-                [
-                    strategy.critics.optimizer,
-                    strategy.actor.optimizer,
-                ],
-                learning_rate=learning_rate,
-            )
             strategy.action_noise.update_noise_decay(updated_noise_decay)
 
         for step in range(self.learning_config.off_policy.gradient_steps):
@@ -302,111 +310,95 @@ class TD3(A2CAlgorithm):
             # ACTOR UPDATE (DELAYED): Accumulate losses for all agents in one pass
             ######################################################################
             if self.n_updates % self.learning_config.off_policy.policy_delay == 0:
-                # Zero-grad for all actors first
-                for strategy in strategies:
-                    strategy.actor.optimizer.zero_grad(set_to_none=True)
-
-                total_actor_loss = 0.0
-
-                # We'll compute each agent's actor loss, accumulate, then do one backprop
+                # clear every unique actor-group optimizer exactly once.
+                self.zero_actor_group_gradients()
+                # preserve one actor loss per unit because every unit has its own critic.
+                actor_losses_by_unit: dict[str, th.Tensor] = {}
                 for i, strategy in enumerate(strategies):
                     actor = strategy.actor
                     critic = strategy.critics
-
-                    # Build local state for actor i
                     state_i = states[:, i, :]
                     action_i = actor(state_i)
-
-                    # Construct final state representation for agent i
                     other_unique_obs = th.cat(
                         (
                             unique_obs_from_others[:, :i],
-                            unique_obs_from_others[:, i + 1 :],
+                            unique_obs_from_others[:, i+1:]
                         ),
-                        dim=1,
+                        dim = 1
                     )
                     all_states_i = th.cat(
                         (
-                            state_i.reshape(self.learning_config.batch_size, -1),
-                            other_unique_obs.reshape(
-                                self.learning_config.batch_size, -1
+                            state_i.reshape(
+                                self.learning_config.batch_size,
+                                -1
                             ),
+                            other_unique_obs.reshape(
+                                self.learning_config.batch_size,
+                                -1
+                            )
                         ),
-                        dim=1,
+                        dim=1
                     )
-
-                    # Replace the i-th agent's action in the batch
+                    # other agent's replay actions remain fixed.
                     all_actions_clone = actions.clone().detach()
+                    # only this unit's action is replaced with its current actor output.
                     all_actions_clone[:, i, :] = action_i
-
-                    # Flatten again for the critic
                     all_actions_clone = all_actions_clone.view(
-                        self.learning_config.batch_size, -1
+                        self.learning_config.batch_size,
+                        -1,
                     )
-
-                    # Calculate actor loss (negative Q1 of the updated action)
+                    # MATD3 actor uses the first critic output.
                     actor_loss = -critic.q1_forward(
-                        all_states_i, all_actions_clone
+                        all_states_i,
+                        all_actions_clone,
                     ).mean()
-
-                    # Store the actor loss for this unit ID
-                    unit_params[step][strategy.unit_id]["actor_loss"] = (
-                        actor_loss.item()
-                    )
-                    # Accumulate actor losses
-                    total_actor_loss += actor_loss
-
-                # Single backward pass for all actors
-                total_actor_loss.backward()
-
-                # Clip and step each actor optimizer
-                for strategy in strategies:
-                    parameters = list(strategy.actor.parameters())
-
-                    # Determine clipping statistics
-                    max_grad_norm = max(p.grad.norm() for p in parameters)
-
-                    # Perform clipping
-                    total_norm = th.nn.utils.clip_grad_norm_(
-                        parameters, max_norm=self.grad_clip_norm
-                    )
-
-                    strategy.actor.optimizer.step()
-
-                    # Store clipping statistics
-                    unit_params[step][strategy.unit_id]["actor_total_grad_norm"] = (
-                        total_norm
-                    )
-                    unit_params[step][strategy.unit_id]["actor_max_grad_norm"] = (
-                        max_grad_norm
-                    )
-
-                # Perform batch-wise Polyak update at the end (instead of inside the loop)
+                    actor_losses_by_unit[strategy.unit_id] = actor_loss
+                    # Preserving individual loss logging even when the actor is shared.
+                    unit_params[step][strategy.unit_id]["actor_loss"] = actor_loss.item()
+                # Convert per-unit losses into one loss per actor group.
+                actor_losses_by_group = self.aggregate_actor_losses(
+                    actor_losses_by_unit
+                )
+                # Different groups own different actors, so group losses are summed.
+                total_group_actor_loss = th.stack(
+                    tuple(actor_losses_by_group.values())
+                ).sum()
+                # One backward pass accumulates every member's contribution into its corresponding shared actor.
+                total_group_actor_loss.backward()
+                # This helper clips and steps each unique actor optimizer once.
+                actor_gradient_metrics = self.clip_and_step_actor_groups(
+                    max_norm=self.grad_clip_norm,
+                )
+                # Storing metrics per unit. All members of one actor group receive the same group-level gradient statistics.
+                for group_id, member_ids in (
+                    self.actor_group_registry.groups.items()
+                ):
+                    group_metrics = actor_gradient_metrics[group_id]
+                    for unit_id in member_ids:
+                        unit_params[step][unit_id][
+                            "actor_total_grad_norm"
+                        ] = group_metrics["actor_total_grad_norm"]
+                        unit_params[step][unit_id][
+                            "actor_max_grad_norm"
+                        ] = group_metrics["actor_max_grad_norm"]
+                # Critics remain independent, so their source and target parameters are still collected per strategy.
                 all_critic_params = []
                 all_target_critic_params = []
-
-                all_actor_params = []
-                all_target_actor_params = []
-
                 for strategy in strategies:
-                    all_critic_params.extend(strategy.critics.parameters())
+                    all_critic_params.extend(
+                        strategy.critics.parameters()
+                    )
                     all_target_critic_params.extend(
                         strategy.target_critics.parameters()
                     )
-
-                    all_actor_params.extend(strategy.actor.parameters())
-                    all_target_actor_params.extend(strategy.actor_target.parameters())
-
-                # Perform batch-wise Polyak update (NO LOOPS)
                 polyak_update(
                     all_critic_params,
                     all_target_critic_params,
                     self.learning_config.off_policy.tau,
                 )
-                polyak_update(
-                    all_actor_params,
-                    all_target_actor_params,
-                    self.learning_config.off_policy.tau,
+                # Actors and target actors are updated once per group.
+                self.soft_update_actor_targets(
+                    tau=self.learning_config.off_policy.tau,
                 )
 
         self.learning_role.write_rl_grad_params_to_output(learning_rate, unit_params)

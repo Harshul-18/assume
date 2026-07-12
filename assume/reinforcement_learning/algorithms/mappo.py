@@ -240,11 +240,20 @@ class PPO(A2CAlgorithm):
         progress_remaining = self.learning_role.get_progress_remaining()
         learning_rate = self.learning_role.calc_lr_from_progress(progress_remaining)
 
-        for strategy in strategies:
-            for param_group in strategy.critics.optimizer.param_groups:
-                param_group["lr"] = learning_rate
-            for param_group in strategy.actor.optimizer.param_groups:
-                param_group["lr"] = learning_rate
+        # PARAMETER-SHARING
+        # component 4: loss aggregation
+        critic_optimizers = [
+            strategy.critics.optimizer
+            for strategy in strategies
+        ]
+        self.update_learning_rate(
+            critic_optimizers,
+            learning_rate=learning_rate,
+        )
+        self.update_learning_rate(
+            list(self.actor_optimizers_by_group.values()),
+            learning_rate=learning_rate,
+        )
 
         # Get last values for advantage computation
         last_values = np.zeros(n_rl_agents)
@@ -311,7 +320,6 @@ class PPO(A2CAlgorithm):
         # Initialize unit_params for gradient logging
         # Use an empty list that will be dynamically extended
         unit_params = []
-        step_count = 0
 
         # Helper to create a new step entry
         def create_step_entry():
@@ -343,13 +351,26 @@ class PPO(A2CAlgorithm):
                     :, :, self.obs_dim - self.unique_obs_dim :
                 ].reshape(current_batch_size, n_rl_agents, -1)
 
+                # PARAMETER-SHARING
+                # component 4: loss aggregation
+                # clear each unique shared actor optimizer once.
+                # Clear each unique shared actor optimizer once.
+                self.zero_actor_group_gradients()
+                # Critics remain independent.
+                for strategy in strategies:
+                    strategy.critics.optimizer.zero_grad(
+                        set_to_none=True
+                    )
+                actor_losses_by_unit: dict[str, th.Tensor] = {}
+                critic_losses_by_unit: dict[str, th.Tensor] = {}
+                policy_loss_values: dict[str, float] = {}
+                value_loss_values: dict[str, float] = {}
+                entropy_loss_values: dict[str, float] = {}
                 for i, strategy in enumerate(strategies):
                     actor = strategy.actor
                     critic = strategy.critics
-
+                    unit_id = strategy.unit_id
                     obs_i = batch.observations[:, i, :]
-
-                    # Construct centralized state
                     other_unique_obs = th.cat(
                         (
                             unique_obs_from_others[:, :i],
@@ -360,130 +381,166 @@ class PPO(A2CAlgorithm):
                     all_states = th.cat(
                         (
                             obs_i.reshape(current_batch_size, -1),
-                            other_unique_obs.reshape(current_batch_size, -1),
+                            other_unique_obs.reshape(
+                                current_batch_size,
+                                -1,
+                            ),
                         ),
                         dim=1,
                     )
-
                     actions_i = batch.actions[:, i, :]
                     old_log_probs_i = batch.old_log_probs[:, i]
                     advantages_i = batch.advantages[:, i]
                     returns_i = batch.returns[:, i]
                     old_values_i = batch.old_values[:, i]
-
-                    # Normalize advantages across the entire batch, not per-mini-batch
-                    # This provides more stable training
                     advantages_flat = advantages_i.flatten()
-                    advantages_i = (advantages_i - advantages_flat.mean()) / (
+                    advantages_i = (
+                        advantages_i - advantages_flat.mean()
+                    ) / (
                         advantages_flat.std() + 1e-8
                     )
-
-                    log_probs, entropy = actor.evaluate_actions(obs_i, actions_i)
+                    log_probs, entropy = actor.evaluate_actions(
+                        obs_i,
+                        actions_i,
+                    )
                     values = critic(all_states).flatten()
-
-                    # Importance sampling ratio
-                    ratio = th.exp(log_probs - old_log_probs_i)
-
-                    # Clipped surrogate objective
+                    ratio = th.exp(
+                        log_probs - old_log_probs_i
+                    )
                     policy_loss_1 = advantages_i * ratio
                     policy_loss_2 = advantages_i * th.clamp(
-                        ratio, 1 - self.clip_range, 1 + self.clip_range
+                        ratio,
+                        1 - self.clip_range,
+                        1 + self.clip_range,
                     )
-                    policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                    # Entropy loss
-                    entropy_loss = -self.entropy_coef * entropy.mean()
-
+                    policy_loss = -th.min(
+                        policy_loss_1,
+                        policy_loss_2,
+                    ).mean()
+                    entropy_loss = (
+                        -self.entropy_coef * entropy.mean()
+                    )
                     if self.clip_range_vf is not None:
-                        # Clipped value function loss
                         values_clipped = old_values_i + th.clamp(
                             values - old_values_i,
                             -self.clip_range_vf,
                             self.clip_range_vf,
                         )
-                        value_loss_1 = F.mse_loss(values, returns_i)
-                        value_loss_2 = F.mse_loss(values_clipped, returns_i)
-                        value_loss = th.max(value_loss_1, value_loss_2)
+                        value_loss_1 = F.mse_loss(
+                            values,
+                            returns_i,
+                        )
+                        value_loss_2 = F.mse_loss(
+                            values_clipped,
+                            returns_i,
+                        )
+                        value_loss = th.max(
+                            value_loss_1,
+                            value_loss_2,
+                        )
                     else:
-                        value_loss = F.mse_loss(values, returns_i)
-
-                    loss = policy_loss + entropy_loss + self.vf_coef * value_loss
-
-                    # Actor update
-                    actor.optimizer.zero_grad()
-                    critic.optimizer.zero_grad()
-                    loss.backward()
-
-                    # Calculate gradient norms BEFORE clipping
-                    actor_params = list(actor.parameters())
-                    critic_params = list(critic.parameters())
-
-                    actor_max_grad_norm = max(
-                        (
-                            p.grad.norm().item()
-                            for p in actor_params
-                            if p.grad is not None
-                        ),
-                        default=0.0,
+                        value_loss = F.mse_loss(
+                            values,
+                            returns_i,
+                        )
+                    # Only policy and entropy terms update the actor.
+                    actor_losses_by_unit[unit_id] = (
+                        policy_loss + entropy_loss
                     )
-                    critic_max_grad_norm = max(
-                        (
-                            p.grad.norm().item()
-                            for p in critic_params
-                            if p.grad is not None
-                        ),
-                        default=0.0,
-                    )
-
-                    # Gradient clipping
-                    actor_total_grad_norm = th.nn.utils.clip_grad_norm_(
-                        actor.parameters(), self.max_grad_norm
-                    )
-                    critic_total_grad_norm = th.nn.utils.clip_grad_norm_(
-                        critic.parameters(), self.max_grad_norm
-                    )
-
-                    actor.optimizer.step()
-                    critic.optimizer.step()
-
-                    # Store metrics
+                    # The value loss belongs to this unit's independent critic.
+                    critic_losses_by_unit[unit_id] = value_loss
+                    # Preserve individual diagnostic values.
+                    policy_loss_values[unit_id] = policy_loss.item()
+                    value_loss_values[unit_id] = value_loss.item()
+                    entropy_loss_values[unit_id] = entropy_loss.item()
                     all_actor_losses.append(policy_loss.item())
                     all_critic_losses.append(value_loss.item())
                     all_entropy_losses.append(entropy_loss.item())
-
-                    # Ensure we have an entry for this step
-                    if step_count >= len(unit_params):
-                        unit_params.append(create_step_entry())
-
-                    # Store per-unit gradient params for this step
-                    unit_params[step_count][strategy.unit_id]["actor_loss"] = (
-                        policy_loss.item()
+                # Combine policy objectives only within actor-sharing groups.
+                actor_losses_by_group = self.aggregate_actor_losses(
+                    actor_losses_by_unit
+                )
+                total_actor_loss = th.stack(
+                    tuple(actor_losses_by_group.values())
+                ).sum()
+                # Critics are independent, so their value losses are summed.
+                total_critic_loss = th.stack(
+                    tuple(critic_losses_by_unit.values())
+                ).sum()
+                # The value coefficient applies only to critic losses.
+                total_loss = (
+                    total_actor_loss
+                    + self.vf_coef * total_critic_loss
+                )
+                # One backward pass calculates gradients for all unique actors and all independent critics.
+                total_loss.backward()
+                actor_gradient_metrics = self.clip_and_step_actor_groups(
+                    max_norm=self.max_grad_norm,
+                )
+                critic_gradient_metrics: dict[
+                    str,
+                    dict[str, float],
+                ] = {}
+                for strategy in strategies:
+                    unit_id = strategy.unit_id
+                    critic = strategy.critics
+                    critic_parameters = [
+                        parameter
+                        for parameter in critic.parameters()
+                        if parameter.grad is not None
+                    ]
+                    if not critic_parameters:
+                        raise RuntimeError(
+                            f"Critic for unit '{unit_id}' has no gradients."
+                        )
+                    critic_max_grad_norm = max(
+                        parameter.grad.detach().norm().item()
+                        for parameter in critic_parameters
                     )
-                    unit_params[step_count][strategy.unit_id]["critic_loss"] = (
-                        value_loss.item()
+                    critic_total_grad_norm = (
+                        th.nn.utils.clip_grad_norm_(
+                            critic_parameters,
+                            max_norm=self.max_grad_norm,
+                        )
                     )
-                    unit_params[step_count][strategy.unit_id][
+                    # Every critic is independent and is stepped once.
+                    critic.optimizer.step()
+                    critic_gradient_metrics[unit_id] = {
+                        "critic_total_grad_norm": float(
+                            critic_total_grad_norm.item()
+                        ),
+                        "critic_max_grad_norm": float(
+                            critic_max_grad_norm
+                        ),
+                    }
+                # One logging entry represents one complete PPO minibatch update.
+                current_step_params = create_step_entry()
+                for strategy in strategies:
+                    unit_id = strategy.unit_id
+                    group_id = self.actor_group_registry.group_for(
+                        unit_id
+                    )
+                    actor_metrics = actor_gradient_metrics[group_id]
+                    critic_metrics = critic_gradient_metrics[unit_id]
+                    current_step_params[unit_id]["actor_loss"] = (
+                        policy_loss_values[unit_id]
+                    )
+                    current_step_params[unit_id]["critic_loss"] = (
+                        value_loss_values[unit_id]
+                    )
+                    current_step_params[unit_id][
                         "actor_total_grad_norm"
-                    ] = (
-                        actor_total_grad_norm.item()
-                        if isinstance(actor_total_grad_norm, th.Tensor)
-                        else actor_total_grad_norm
-                    )
-                    unit_params[step_count][strategy.unit_id]["actor_max_grad_norm"] = (
-                        actor_max_grad_norm
-                    )
-                    unit_params[step_count][strategy.unit_id][
+                    ] = actor_metrics["actor_total_grad_norm"]
+                    current_step_params[unit_id][
+                        "actor_max_grad_norm"
+                    ] = actor_metrics["actor_max_grad_norm"]
+                    current_step_params[unit_id][
                         "critic_total_grad_norm"
-                    ] = (
-                        critic_total_grad_norm.item()
-                        if isinstance(critic_total_grad_norm, th.Tensor)
-                        else critic_total_grad_norm
-                    )
-                    unit_params[step_count][strategy.unit_id][
+                    ] = critic_metrics["critic_total_grad_norm"]
+                    current_step_params[unit_id][
                         "critic_max_grad_norm"
-                    ] = critic_max_grad_norm
-
-                step_count += 1
+                    ] = critic_metrics["critic_max_grad_norm"]
+                unit_params.append(current_step_params)
 
         self.n_updates += 1
 

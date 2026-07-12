@@ -11,6 +11,7 @@ from torch.optim import AdamW
 from assume.common.base import LearningStrategy
 from assume.reinforcement_learning.algorithms import actor_architecture_aliases
 from assume.reinforcement_learning.learning_utils import (
+    polyak_update,
     transfer_weights,
 )
 from assume.reinforcement_learning.parameter_sharing import (
@@ -790,3 +791,97 @@ class A2CAlgorithm(RLAlgorithm):
                             f"Actor target group '{group_id}' did not preserve shared object identity."
                         )
                 self.actor_targets_by_group[group_id] = target
+
+    # PARAMETER-SHARING
+    # component 4: loss aggregation
+    def aggregate_actor_losses(
+        self,
+        losses_by_unit
+    ):
+        group_losses = {}
+        for group_id, member_ids in self.actor_group_registry.groups.items():
+            member_losses = [
+                losses_by_unit[unit_id] for unit_id in member_ids
+            ]
+            stacked_losses = th.stack(member_losses)
+            method = self.learning_config.parameter_sharing.loss_aggregation
+            if method == "mean":
+                group_losses[group_id] = stacked_losses.mean()
+            elif method == "sum":
+                group_losses[group_id] = stacked_losses.sum()
+            else:
+                raise NotImplementedError(
+                    f"loss_aggregation='{method}' is not implemented yet."
+                )
+        return group_losses
+
+    # PARAMETER-SHARING
+    # component 4: loss aggregation
+    def zero_actor_group_gradients(self):
+        for optimizer in self.actor_optimizers_by_group.values():
+            optimizer.zero_grad(set_to_none=True)
+
+    # PARAMETER-SHARING
+    # component 4: loss aggregation
+    def clip_and_step_actor_groups(
+        self,
+        max_norm: float,
+    ) -> dict[str, dict[str, float]]:
+        """Clip gradients and step every unique actor-group optimizer once."""
+        gradient_metrics: dict[str, dict[str, float]] = {}
+        for group_id, actor in self.actors_by_group.items():
+            # Only parameters that received gradients should participate.
+            parameters_with_grad = [
+                parameter for parameter in actor.parameters() if parameter.grad is not None
+            ]
+            if not parameters_with_grad:
+                raise RuntimeError(
+                    f"Actor group '{group_id}' has no gradients. Make sure its member losses were included before backward()."
+                )
+            # Largest individual parameter-gradient norm before clipping.
+            max_grad_norm = max(
+                parameter.grad.detach().norm().item()
+                for parameter in parameters_with_grad
+            )
+            # clip_grad_norm_ returns the total norm measured before clipping.
+            total_grad_norm = th.nn.utils.clip_grad_norm_(
+                parameters_with_grad,
+                max_norm=max_norm,
+            )
+            optimizer = self.actor_optimizers_by_group[group_id]
+            # This is the one and only optimizer step for this group.
+            optimizer.step()
+            gradient_metrics[group_id] = {
+                "actor_total_grad_norm": float(total_grad_norm.item()),
+                "actor_max_grad_norm": float(max_grad_norm),
+            }
+        return gradient_metrics
+
+    # PARAMETER-SHARING
+    # component 4: loss aggregation
+    def soft_update_actor_targets(
+        self,
+        tau: float
+    ) -> None:
+        """Update every unique target actor exactly once. If an algorithm does not use target actors, this method safely returns when target networks are disabled."""
+        if not self.uses_target_networks:
+            return
+        if not 0.0 <= tau <= 1.0:
+            raise ValueError(
+                f"Polyak coefficient tau must be between 0 and 1, got {tau}."
+            )
+        actor_group_ids = set(self.actors_by_group)
+        target_group_ids = set(self.actor_targets_by_group)
+        if actor_group_ids != target_group_ids:
+            missing_targets = actor_group_ids - target_group_ids
+            unexpected_targets = target_group_ids - actor_group_ids
+            raise RuntimeError(
+                f"Actor and target-actor group mappings do not match. Missing targets: {sorted(missing_targets)}, Unexpected targets: {sorted(unexpected_targets)}"
+            )
+        for group_id, actor in self.actors_by_group.items():
+            target_actor = self.actor_targets_by_group[group_id]
+            polyak_update(
+                actor.parameters(),
+                target_actor.parameters(),
+                tau
+            )

@@ -45,8 +45,10 @@ base:
     # PARAMETER-SHARING
     # component 1: configuration parsing.
     # component 2: grouping
+    # component 3: conditioning
+    # component 4: loss aggregation
     parameter_sharing:
-      enabled: false
+      enabled: True
       actor_mode: grouped
       critic_mode: independent
       grouping_method: semantic

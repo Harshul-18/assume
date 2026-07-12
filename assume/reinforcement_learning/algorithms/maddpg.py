@@ -142,11 +142,21 @@ class DDPG(A2CAlgorithm):
         learning_rate = self.learning_role.calc_lr_from_progress(progress_remaining)
 
         # Update learning rates and noise schedules for all strategies
+        # PARAMETER-SHARING
+        # component 4: loss aggregation
+        critic_optimizers = [
+            strategy.critics.optimizer
+            for strategy in strategies
+        ]
+        self.update_learning_rate(
+            critic_optimizers,
+            learning_rate=learning_rate,
+        )
+        self.update_learning_rate(
+            list(self.actor_optimizers_by_group.values()),
+            learning_rate=learning_rate,
+        )
         for strategy in strategies:
-            self.update_learning_rate(
-                [strategy.critics.optimizer, strategy.actor.optimizer],
-                learning_rate=learning_rate,
-            )
             strategy.action_noise.update_noise_decay(updated_noise_decay)
 
         # Perform gradient updates for specified number of steps
@@ -266,86 +276,88 @@ class DDPG(A2CAlgorithm):
                     max_grad_norm
                 )
 
-            # ------------------------------------------------------------
             # ACTOR UPDATE PHASE (updated every step)
-            # ------------------------------------------------------------
-            for strategy in strategies:
-                strategy.actor.optimizer.zero_grad(set_to_none=True)
-
-            total_actor_loss = 0.0
-
+            # PARAMETER-SHARING
+            # component 4: loss aggregation
+            self.zero_actor_group_gradients()
+            actor_losses_by_unit: dict[str, th.Tensor] = {}
             for i, strategy in enumerate(strategies):
                 actor = strategy.actor
                 critic = strategy.critics
-
                 state_i = states[:, i, :]
                 action_i = actor(state_i)
-
                 other_unique_obs = th.cat(
-                    (unique_obs_from_others[:, :i], unique_obs_from_others[:, i + 1 :]),
+                    (
+                        unique_obs_from_others[:, :i],
+                        unique_obs_from_others[:, i + 1 :],
+                    ),
                     dim=1,
                 )
                 all_states_i = th.cat(
                     (
-                        state_i.reshape(self.learning_config.batch_size, -1),
-                        other_unique_obs.reshape(self.learning_config.batch_size, -1),
+                        state_i.reshape(
+                            self.learning_config.batch_size,
+                            -1,
+                        ),
+                        other_unique_obs.reshape(
+                            self.learning_config.batch_size,
+                            -1,
+                        ),
                     ),
                     dim=1,
                 )
-
                 all_actions_clone = actions.clone().detach()
                 all_actions_clone[:, i, :] = action_i
                 all_actions_clone = all_actions_clone.view(
-                    self.learning_config.batch_size, -1
+                    self.learning_config.batch_size,
+                    -1,
                 )
-
-                # Actor loss: maximize Q-value
-                actor_loss = -critic(all_states_i, all_actions_clone).mean()
-
+                # MADDPG has one Q-value output per critic.
+                actor_loss = -critic(
+                    all_states_i,
+                    all_actions_clone,
+                ).mean()
+                actor_losses_by_unit[strategy.unit_id] = actor_loss
                 unit_params[step][strategy.unit_id]["actor_loss"] = actor_loss.item()
-                total_actor_loss += actor_loss
+            actor_losses_by_group = self.aggregate_actor_losses(
+                actor_losses_by_unit
+            )
+            total_group_actor_loss = th.stack(
+                tuple(actor_losses_by_group.values())
+            ).sum()
+            total_group_actor_loss.backward()
+            actor_gradient_metrics = self.clip_and_step_actor_groups(
+                max_norm=self.grad_clip_norm,
+            )
+            for group_id, member_ids in (
+                self.actor_group_registry.groups.items()
+            ):
+                group_metrics = actor_gradient_metrics[group_id]
+                for unit_id in member_ids:
+                    unit_params[step][unit_id][
+                        "actor_total_grad_norm"
+                    ] = group_metrics["actor_total_grad_norm"]
+                    unit_params[step][unit_id][
+                        "actor_max_grad_norm"
+                    ] = group_metrics["actor_max_grad_norm"]
 
-            # Backward pass for actors
-            total_actor_loss.backward()
-
-            for strategy in strategies:
-                parameters = list(strategy.actor.parameters())
-                max_grad_norm = max(p.grad.norm() for p in parameters)
-                total_norm = th.nn.utils.clip_grad_norm_(
-                    parameters, max_norm=self.grad_clip_norm
-                )
-                strategy.actor.optimizer.step()
-
-                unit_params[step][strategy.unit_id]["actor_total_grad_norm"] = (
-                    total_norm
-                )
-                unit_params[step][strategy.unit_id]["actor_max_grad_norm"] = (
-                    max_grad_norm
-                )
-
-            # ------------------------------------------------------------
-            # TARGET NETWORK UPDATE PHASE (Polyak averaging)
-            # ------------------------------------------------------------
+            # TARGET NETWORK UPDATE PHASE
             all_critic_params = []
             all_target_critic_params = []
-            all_actor_params = []
-            all_target_actor_params = []
-
             for strategy in strategies:
-                all_critic_params.extend(strategy.critics.parameters())
-                all_target_critic_params.extend(strategy.target_critics.parameters())
-                all_actor_params.extend(strategy.actor.parameters())
-                all_target_actor_params.extend(strategy.actor_target.parameters())
-
+                all_critic_params.extend(
+                    strategy.critics.parameters()
+                )
+                all_target_critic_params.extend(
+                    strategy.target_critics.parameters()
+                )
             polyak_update(
                 all_critic_params,
                 all_target_critic_params,
                 self.learning_config.off_policy.tau,
             )
-            polyak_update(
-                all_actor_params,
-                all_target_actor_params,
-                self.learning_config.off_policy.tau,
+            self.soft_update_actor_targets(
+                tau=self.learning_config.off_policy.tau,
             )
 
         # Log gradient parameters and metrics to output
