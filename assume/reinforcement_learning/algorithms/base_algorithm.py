@@ -227,6 +227,7 @@ class A2CAlgorithm(RLAlgorithm):
     #: Whether this algorithm uses target networks for stability.
     #: TD3 and DDPG use target networks (True), PPO does not (False).
     uses_target_networks: bool = True
+    critic_architecture_class: type[th.nn.Module]
 
     def __init__(self, learning_role):
         """Initialize the actor-critic algorithm.
@@ -289,11 +290,12 @@ class A2CAlgorithm(RLAlgorithm):
         with open(map_path, "w") as f:
             json.dump(mapping, f, indent=2)
 
+    # PARAMETER-SHARING
+    # component 5: group-aware checkpointing
     def save_actor_params(self, directory: str) -> None:
         """Save actor network parameters.
 
-        Saves actor networks, their optimizers, and target actors (if applicable)
-        for all registered learning strategies.
+        Saves actor networks, their optimizers, and target actors (if applicable) for all registered learning strategies. And saves one actor checkpoint per actor-sharing group.
 
         Args:
             directory: Directory path where actor parameters will be saved.
@@ -303,17 +305,36 @@ class A2CAlgorithm(RLAlgorithm):
             >>> algorithm.save_actor_params('/path/to/actors/')
         """
         os.makedirs(directory, exist_ok=True)
-        for u_id, strategy in self.learning_role.rl_strats.items():
-            obj = {
-                "actor": strategy.actor.state_dict(),
-                "actor_optimizer": strategy.actor.optimizer.state_dict(),
+        manifest = self.build_actor_checkpoint_manifest()
+        for group_id, group_data in manifest["groups"].items():
+            actor = self.actors_by_group[group_id]
+            optimizer = self.actor_optimizers_by_group[group_id]
+            checkpoint = {
+                "actor": actor.state_dict(),
+                "actor_optimizer": optimizer.state_dict()
             }
-            # Only save target actor if this algorithm uses target networks
             if self.uses_target_networks:
-                obj["actor_target"] = strategy.actor_target.state_dict()
-
-            path = f"{directory}/actor_{u_id}.pt"
-            th.save(obj, path)
+                target_actor = self.actor_targets_by_group[group_id]
+                checkpoint["actor_target"] = target_actor.state_dict()
+            checkpoint_path = os.path.join(
+                directory,
+                group_data["checkpoint"]
+            )
+            th.save(
+                checkpoint,
+                checkpoint_path
+            )
+        manifest_path = os.path.join(
+            directory,
+            "sharing_manifest.json"
+        )
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(
+                manifest,
+                manifest_file,
+                indent=2,
+                sort_keys = True
+            )
 
     def load_params(self, directory: str) -> None:
         """
@@ -451,7 +472,9 @@ class A2CAlgorithm(RLAlgorithm):
             except Exception as e:
                 logger.warning(f"Failed to load critic for {u_id}: {e}")
 
-    def load_actor_params(self, directory: str) -> None:
+    # PARAMETER-SHARING
+    # component 5: group-aware checkpointing
+    def load_legacy_actor_params(self, directory: str) -> None:
         """Load actor network parameters.
 
         Loads actor networks, target actors (if applicable), and optimizer states
@@ -463,31 +486,100 @@ class A2CAlgorithm(RLAlgorithm):
         Example:
             >>> algorithm.load_actor_params('/path/to/saved/parameters/')
         """
+        actors_directory = os.path.join(
+            directory,
+            "actors"
+        )
+        for group_id, member_ids in self.actor_group_registry.groups.items():
+            checkpoint_path = None
+            for unit_id in member_ids:
+                candidate = os.path.join(
+                    actors_directory,
+                    f"actor_{unit_id}.pt"
+                )
+                if os.path.isfile(candidate):
+                    checkpoint_path = candidate
+                    break
+            if checkpoint_path is None:
+                logger.warning(f"No legacy actor checkpoint found for groupo '{group_id}'.")
+                continue
+            actor_params = self.load_obj(directory=checkpoint_path)
+            actor = self.actors_by_group[group_id]
+            optimizer = self.actor_optimizers_by_group[group_id]
+            actor.load_state_dict(actor_params["actor"])
+            optimizer.load_state_dict(actor_params["actor_optimizer"])
+            if self.uses_target_networks:
+                if "actor_target" not in actor_params:
+                    raise KeyError(f"Legacy checkpoint for group '{group_id}' does not contain actor_target.")
+                self.actor_targets_by_group[group_id].load_state_dict(actor_params["actor_target"])
+            actor.loaded = True
+
+    # PARAMETER-SHARING
+    # component 5: group-aware checkpointing
+    def load_actor_params(self, directory: str) -> None:
+        """Load one actor checkpoint per actor-sharing group."""
         logger.info("Loading actor parameters...")
-        if not os.path.exists(directory):
-            logger.warning(
-                "Specified directory for loading the actors does not exist! Starting with randomly initialized values!"
-            )
+        actors_directory = os.path.join(directory, "actors")
+        if not os.path.isdir(actors_directory):
+            logger.warning(f"Actor directory '{actors_directory}' does not exist. Using randomly initialized actors.")
             return
-
-        for u_id, strategy in self.learning_role.rl_strats.items():
-            try:
-                actor_params = self.load_obj(
-                    directory=f"{directory}/actors/actor_{str(u_id)}.pt"
-                )
-                strategy.actor.load_state_dict(actor_params["actor"])
-                strategy.actor.optimizer.load_state_dict(
-                    actor_params["actor_optimizer"]
-                )
-
-                # Only load target actor if this algorithm uses target networks
-                if self.uses_target_networks and "actor_target" in actor_params:
-                    strategy.actor_target.load_state_dict(actor_params["actor_target"])
-
-                # add a tag to the strategy to indicate that the actor was loaded
-                strategy.actor.loaded = True
-            except Exception:
-                logger.warning(f"No actor values loaded for agent {u_id}")
+        manifest_path = os.path.join(
+            actors_directory,
+            "sharing_manifest.json"
+        )
+        # Backward compatibility with per-unit actor checkpoints.
+        if not os.path.isfile(manifest_path):
+            logger.info("No sharing manifest found. Trying per-unit actor checkpoints.")
+            self.load_legacy_actor_params(directory)
+            return
+        with open(manifest_path, encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        if manifest.get("schema_version") != 1:
+            raise ValueError(f"Unsupported actor checkpoint schema version: {manifest.get('schema_version')!r}.")
+        saved_algorithm = manifest.get("algorithm")
+        if saved_algorithm != self.learning_config.algorithm:
+            raise ValueError(
+                f"Checkpoint algorithm '{saved_algorithm}' does not match current algorithm '{self.learning_config.algorithm}'."
+            )
+        saved_mapping = manifest.get("unit_to_actor_group", {})
+        current_mapping = dict(self.actor_group_registry.unit_to_group)
+        if saved_mapping != current_mapping:
+            missing_units = set(current_mapping) - set(saved_mapping)
+            unknown_units = set(saved_mapping) - set(current_mapping)
+            changed_units = {
+                unit_id: {
+                    "saved": saved_mapping[unit_id],
+                    "current": current_mapping[unit_id]
+                }
+                for unit_id in (set(saved_mapping) & set(current_mapping)) if saved_mapping[unit_id] != current_mapping[unit_id]
+            }
+            raise ValueError(f"Actor-sharing mapping does not match checkpoint. Missing units: {sorted(missing_units)}, unknown units: {sorted(unknown_units)}, changed units: {changed_units}.")
+        saved_groups = manifest.get("groups", {})
+        for group_id in self.actor_group_registry.groups:
+            if group_id not in saved_groups:
+                raise KeyError(f"Checkpoint manifest does not contain actor group '{group_id}'")
+            checkpoint_filename = saved_groups[group_id].get("checkpoint")
+            if (
+                not isinstance(checkpoint_filename, str)
+                or os.path.basename(checkpoint_filename) != checkpoint_filename
+            ):
+                raise ValueError(f"Invalid checkpoint filename for group '{group_id}': {checkpoint_filename!r}.")
+            checkpoint_path = os.path.join(
+                actors_directory,
+                checkpoint_filename
+            )
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(f"Actor checkpoint for group '{group_id}' does not exist: {checkpoint_path}.")
+            actor_params = self.load_obj(directory=checkpoint_path)
+            actor = self.actors_by_group[group_id]
+            optimizer = self.actor_optimizers_by_group[group_id]
+            actor.load_state_dict(actor_params["actor"])
+            optimizer.load_state_dict(actor_params["actor_optimizer"])
+            if self.uses_target_networks:
+                if "actor_target" not in actor_params:
+                    raise KeyError(f"Actor checkpoint for group '{group_id}' does not contain actor_target.")
+                self.actor_targets_by_group[group_id].load_state_dict(actor_params["actor_target"])
+            actor.loaded = True
 
     def initialize_policy(self, actors_and_critics: dict = None) -> None:
         """
@@ -885,3 +977,31 @@ class A2CAlgorithm(RLAlgorithm):
                 target_actor.parameters(),
                 tau
             )
+
+    # PARAMETER-SHARING
+    # component 5: group-aware checkpointing
+    def build_actor_checkpoint_manifest(self) -> dict:
+        """describing actor-group ownership and checkpoint filenames."""
+        config = self.learning_config.parameter_sharing
+        groups = {}
+        for index, (group_id, member_ids) in enumerate(
+            self.actor_group_registry.groups.items()
+        ):
+            groups[group_id] = {
+                "members": list(member_ids),
+                "checkpoint": f"actor_group_{index}.pt"
+            }
+        return {
+            "schema_version": 1,
+            "algorithm": self.learning_config.algorithm,
+            "parameter_sharing_enabled": config.enabled,
+            "actor_mode": config.actor_mode,
+            "grouping_method": config.grouping_method,
+            "grouping_feature": config.grouping_feature,
+            "loss_aggregation": config.loss_aggregation,
+            "uses_target_networks": self.uses_target_networks,
+            "unit_to_actor_group": dict(
+                self.actor_group_registry.unit_to_group
+            ),
+            "groups": groups
+        }

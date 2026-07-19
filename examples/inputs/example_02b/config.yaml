@@ -47,21 +47,22 @@ base:
     # component 2: grouping
     # component 3: conditioning
     # component 4: loss aggregation
+    # component 5: group-aware checkpointing.
     parameter_sharing:
       enabled: True
       actor_mode: grouped
       critic_mode: independent
-      grouping_method: semantic
+      grouping_method: manual
       grouping_feature: fuel_type
       conditioning_method: none
       context_architecture: concatenation
       loss_aggregation: mean
-      unit_to_group: {}
-        # pp_6: gas_group
-        # pp_7: gas_group
-        # pp_8: gas_group
-        # pp_9: gas_group
-        # pp_10: wind_group
+      unit_to_group:
+        pp_6: gas_group
+        pp_7: gas_group
+        pp_8: gas_group
+        pp_9: gas_group
+        pp_10: wind_group
       context_features: []
       n_clusters: null
       max_group_size: null

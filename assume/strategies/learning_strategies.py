@@ -5,6 +5,7 @@
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+import json
 
 import numpy as np
 import torch as th
@@ -117,17 +118,41 @@ class TorchLearningStrategy(LearningStrategy):
                 f"No policies were provided for DRL unit {self.unit_id}!. Please provide a valid path to the trained policies. Expected them under filepath '{self.learning_config.trained_policies_load_path}'."
             )
 
+    # PARAMETER-SHARING
+    # component 5: group-aware checkpointing
     def load_actor_params(self, load_path):
         """
-        Load actor parameters.
+        Load actor parameters through the sharing manifest.
 
         Args:
             load_path (str): The path to load parameters from.
         """
-        directory = f"{load_path}/actors/actor_{self.unit_id}.pt"
-
-        params = th.load(directory, map_location=self.device, weights_only=True)
-
+        actors_directory = Path(load_path) / "actors"
+        manifest_path = actors_directory / "sharing_manifest.json"
+        if manifest_path.is_file():
+            with manifest_path.open(encoding="utf-8") as manifest_file:
+                manifest = json.load(manifest_file)
+            if manifest.get("schema_version") != 1:
+                raise ValueError(f"Unsupported actor checkpoint schema version: {manifest.get('schema_version')!r}.")
+            unit_to_group = manifest.get("unit_to_actor_group", {})
+            if self.unit_id not in unit_to_group:
+                raise KeyError(f"Unit '{self.unit_id}' is not present in the actor-sharing manifest.")
+            group_id = unit_to_group[self.unit_id]
+            group_data = manifest.get("groups", {}).get(group_id)
+            if group_data is None:
+                raise KeyError(f"Actor group '{group_id}' is missing from the checkpoint manifest.")
+            checkpoint_filename = group_data.get("checkpoint")
+            if (
+                not isinstance(checkpoint_filename, str)
+                or Path(checkpoint_filename).name != checkpoint_filename
+            ):
+                raise ValueError(f"Invalid actor checkpoint filename: {checkpoint_filename!r}.")
+            checkpoint_path = actors_directory / checkpoint_filename
+        else:
+            checkpoint_path = actors_directory / f"actor_{self.unit_id}.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Actor checkpoint does not exist: {checkpoint_path}")
+        params = th.load(checkpoint_path, map_location=self.device, weights_only=True)
         self.actor = self.actor_architecture_class(
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
