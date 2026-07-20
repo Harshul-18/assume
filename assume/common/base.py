@@ -1063,6 +1063,29 @@ class ParameterSharingConfig:
                 "unit_to_group must be provided when grouping_method='manual'"
             )
 
+        # PARAMETER-SHARING
+        # component 6: conditioning-vector construction
+        if not isinstance(self.context_features, list):
+            raise TypeError("context_features must be a list of metadata field names.")
+        cleaned_context_features = []
+        for feature_name in self.context_features:
+            if (
+                not isinstance(feature_name, str)
+                or not feature_name.strip()
+            ):
+                raise ValueError("Every context feature must be a non-empty string.")
+            cleaned_context_features.append(feature_name.strip())
+        if len(set(cleaned_context_features)) != len(cleaned_context_features):
+            raise ValueError("context_features must not contain duplicates.")
+        self.context_features = cleaned_context_features
+        if (
+            self.conditioning_method in {
+                "semantic_context",
+                "unit_id_and_context"
+            } and not self.context_features
+        ):
+            raise ValueError(f"context_features must be provided when conditioning_method='{self.conditioning_method}'.")
+
     @staticmethod
     def _validate_choice(
         field_name: str,

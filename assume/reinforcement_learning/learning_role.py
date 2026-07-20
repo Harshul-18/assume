@@ -66,6 +66,12 @@ class Learning(Role):
         self.learning_config = learning_config
         self.critics = {}
         self.target_critics = {}
+        # PARAMETER-SHARING
+        # component 6: conditioning-vector construction
+        # Parameter-sharing registries are populated during policy initialization.
+        self.actor_group_registry = None
+        self.critic_group_registry = None
+        self.conditioning_registry = None
 
         device = "cpu"
         if self.learning_config:

@@ -16,7 +16,9 @@ from assume.reinforcement_learning.learning_utils import (
 )
 from assume.reinforcement_learning.parameter_sharing import (
     NetworkGroupRegistry,
+    ConditioningRegistry,
     build_group_registry,
+    build_conditioning_registry
 )
 
 logger = logging.getLogger(__name__)
@@ -198,6 +200,32 @@ class RLAlgorithm:
         # exposing the registries through the Learning Role for diagnostics.
         self.learning_role.actor_group_registry = self.actor_group_registry
         self.learning_role.critic_group_registry = self.critic_group_registry
+
+    # PARAMETER-SHARING
+    # component 6: conditioning-vector construction
+    def build_parameter_sharing_conditioning(self) -> None:
+        """Build and exposing the fixed unit-conditioning vectors."""
+        self.conditioning_registry: ConditioningRegistry = build_conditioning_registry(
+            strategies = self.learning_role.rl_strats,
+            config = self.learning_config.parameter_sharing
+        )
+        self.learning_role.conditioning_registry = self.conditioning_registry
+
+    # PARAMETER-SHARING
+    # component 6: conditioning-vector construction
+    def conditioning_tensor(self, unit_id: str, batch_size: int | None = None) -> th.Tensor:
+        """Convert one unit's fixed context to a device tensor."""
+        values = self.conditioning_registry.vector_for(unit_id)
+        tensor = th.as_tensor(
+            values,
+            dtype = self.float_type,
+            device = self.device
+        )
+        if batch_size is None:
+            return tensor
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        return tensor.unsqueeze(0).expand(batch_size, -1)
 
 
 class A2CAlgorithm(RLAlgorithm):
@@ -604,6 +632,9 @@ class A2CAlgorithm(RLAlgorithm):
         # PARAMETER-SHARING
         # component 2: grouping
         self.build_parameter_sharing_groups()
+        # PARAMETER-SHARING
+        # component 6: conditioning-vector construction
+        self.build_parameter_sharing_conditioning()
 
         if actors_and_critics is None:
             self.check_strategy_dimensions()
