@@ -85,6 +85,11 @@ class TorchLearningStrategy(LearningStrategy):
         # float_type = kwargs.get("float_type", "float32")
         self.float_type = th.float
 
+        # PARAMETER-SHARING
+        # component 7: actor input
+        self.actor_conditioning = th.empty(0, dtype=self.float_type, device=self.device)
+        self.actor_conditioning_feature_names: tuple[str, ...] = ()
+
         # define standard deviation for the initial exploration noise
         self.exploration_noise_std = self.learning_config.exploration_noise_std
 
@@ -127,6 +132,10 @@ class TorchLearningStrategy(LearningStrategy):
         Args:
             load_path (str): The path to load parameters from.
         """
+        # PARAMETER-SHARING
+        # component 7: actor input
+        self.actor_conditioning = th.empty(0, dtype=self.float_type, device=self.device)
+        self.actor_conditioning_feature_names = ()
         actors_directory = Path(load_path) / "actors"
         manifest_path = actors_directory / "sharing_manifest.json"
         if manifest_path.is_file():
@@ -148,13 +157,43 @@ class TorchLearningStrategy(LearningStrategy):
             ):
                 raise ValueError(f"Invalid actor checkpoint filename: {checkpoint_filename!r}.")
             checkpoint_path = actors_directory / checkpoint_filename
+            # PARAMETER-SHARING
+            # component 7: actor input
+            conditioning = manifest.get("conditioning")
+            if conditioning is not None:
+                context_dim = conditioning.get("context_dim")
+                feature_names = conditioning.get("feature_names", [])
+                unit_to_vector = conditioning.get("unit_to_vector", {})
+                if not isinstance(context_dim, int) or context_dim < 0:
+                    raise ValueError("Checkpoint conditioning context_dim must be a non-negative integer.")
+                if self.unit_id not in unit_to_vector:
+                    raise KeyError(f"Unit '{self.unit_id}' has no conditioning vector in the checkpoint manifest.")
+                saved_vector = unit_to_vector[self.unit_id]
+                if not isinstance(saved_vector, list):
+                    raise TypeError(f"Conditioning vector for unit '{self.unit_id}' must be a list.")
+                if len(saved_vector) != context_dim:
+                    raise ValueError(f"Conditioning vector for unit '{self.unit_id}' has dimension {len(saved_vector)}, expected {context_dim}.")
+                if len(feature_names) != context_dim:
+                    raise ValueError("Checkpoint conditioning feature-name count does not match context_dim.")
+                self.actor_conditioning = th.as_tensor(
+                    saved_vector,
+                    dtype = self.float_type,
+                    device = self.device
+                )
+                self.actor_conditioning_feature_names = tuple(feature_names)
         else:
             checkpoint_path = actors_directory / f"actor_{self.unit_id}.pt"
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"Actor checkpoint does not exist: {checkpoint_path}")
         params = th.load(checkpoint_path, map_location=self.device, weights_only=True)
+        actor_input_dim = self.obs_dim + self.actor_conditioning.numel()
+        if (
+            self.actor_conditioning.numel() > 0
+            and self.actor_architecture != "mlp"
+        ):
+            raise NotImplementedError("Context concatenation currently supports only MLP actors during standalone inference.")
         self.actor = self.actor_architecture_class(
-            obs_dim=self.obs_dim,
+            obs_dim=actor_input_dim,
             act_dim=self.act_dim,
             float_type=self.float_type,
             unique_obs_dim=self.unique_obs_dim,
@@ -162,6 +201,28 @@ class TorchLearningStrategy(LearningStrategy):
         ).to(self.device)
         self.actor.load_state_dict(params["actor"])
         self.actor.eval()  # set the actor to evaluation mode
+
+    # PARAMETER-SHARING
+    # component 7: actor input
+    def prepare_inference_actor_input(
+        self,
+        observations: th.Tensor,
+    ) -> th.Tensor:
+        """Append checkpointed unit context for standalone inference."""
+        if observations.dim() not in {1, 2}:
+            raise ValueError(f"Inference actor observations must be one-dimensional or two-dimensional, got shape {tuple(observations.shape)}.")
+        if observations.shape[-1] != self.obs_dim:
+            raise ValueError(f"Inference observation for unit '{self.unit_id}' has dimension {observations.shape[-1]}, expected {self.obs_dim}.")
+        if self.actor_conditioning.numel() == 0:
+            return observations
+        if observations.dim() == 1:
+            context = self.actor_conditioning
+        else:
+            context = self.actor_conditioning.unsqueeze(0).expand(observations.shape[0], -1)
+        return th.cat(
+            (observations, context),
+            dim=-1,
+        )
 
     def prepare_observations(self, unit, market_id):
         # scaling factors for the observations
@@ -319,12 +380,12 @@ class TorchLearningStrategy(LearningStrategy):
 
         # A final inference run does not create an RL algorithm. Use the actor
         # loaded by ``load_actor_params`` directly and keep PPO deterministic.
+        actor_input = self.prepare_inference_actor_input(next_observation)
         with th.no_grad():
             if self.algorithm == "mappo":
-                action = self.actor(next_observation, deterministic=True)
+                action = self.actor(actor_input, deterministic=True)
             else:
-                action = self.actor(next_observation)
-
+                action = self.actor(actor_input)
         noise = th.zeros_like(action, dtype=self.float_type)
         return action, noise
 

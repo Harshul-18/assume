@@ -79,8 +79,10 @@ class TD3(A2CAlgorithm):
                     device=strategy.device,
                 )
                 return noise, noise
-
-            action = strategy.actor(obs).detach()
+            # PARAMETER-SHARING
+            # component 7: actor input
+            actor_input = self.prepare_actor_input(strategy.unit_id, obs)
+            action = strategy.actor(actor_input).detach()
             noise = strategy.action_noise.noise(
                 device=strategy.device, dtype=strategy.float_type
             )
@@ -92,7 +94,10 @@ class TD3(A2CAlgorithm):
             return action, noise
 
         # Evaluation
-        action = strategy.actor(obs).detach()
+        # PARAMETER-SHARING
+        # component 7: actor input
+        actor_input = self.prepare_actor_input(strategy.unit_id, obs)
+        action = strategy.actor(actor_input).detach()
         noise = th.zeros(
             strategy.act_dim, dtype=strategy.float_type, device=strategy.device
         )
@@ -191,7 +196,10 @@ class TD3(A2CAlgorithm):
                 next_actions = th.stack(
                     [
                         (
-                            strategy.actor_target(next_states[:, i, :]) + noise[:, i, :]
+                            strategy.actor_target(self.prepare_actor_input(
+                                strategy.unit_id,
+                                next_states[:, i, :]
+                            )) + noise[:, i, :]
                         ).clamp(-1, 1)
                         for i, strategy in enumerate(strategies)
                     ]
@@ -318,7 +326,8 @@ class TD3(A2CAlgorithm):
                     actor = strategy.actor
                     critic = strategy.critics
                     state_i = states[:, i, :]
-                    action_i = actor(state_i)
+                    actor_input_i = self.prepare_actor_input(strategy.unit_id, state_i)
+                    action_i = actor(actor_input_i)
                     other_unique_obs = th.cat(
                         (
                             unique_obs_from_others[:, :i],

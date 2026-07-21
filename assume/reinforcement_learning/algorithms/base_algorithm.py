@@ -51,6 +51,8 @@ class RLAlgorithm:
         ...         # Custom action selection logic
         ...         pass
     """
+    obs_dim: int
+    conditioning_registry: ConditioningRegistry
 
     def __init__(self, learning_role):
         """Initialize the RL algorithm.
@@ -226,6 +228,37 @@ class RLAlgorithm:
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
         return tensor.unsqueeze(0).expand(batch_size, -1)
+
+    # PARAMETER-SHARING
+    # component 7: actor input
+    @property
+    def actor_input_dim(self) -> int:
+        """Return observation plus conditioning dimensions."""
+        return self.obs_dim + self.conditioning_registry.context_dim
+
+    # PARAMETER-SHARING
+    # component 7: actor input
+    def prepare_actor_input(
+        self,
+        unit_id: str,
+        observations: th.Tensor
+    ) -> th.Tensor:
+        """Append one unit's conditioning vector to actor observations."""
+        if observations.dim() not in {1, 2}:
+            raise ValueError(f"Actor observations must be one-dimensional or two-dimensional, got shape {tuple(observations.shape)}")
+        if observations.shape[-1] != self.obs_dim:
+            raise ValueError(f"Actor observation for unit '{unit_id}' has dimension {observations.shape[-1]}, expected {self.obs_dim}.")
+        if observations.dim() == 1:
+            context = self.conditioning_tensor(unit_id)
+        else:
+            context = self.conditioning_tensor(
+                unit_id,
+                batch_size = observations.shape[0]
+            )
+        return th.cat(
+            (observations, context),
+            dim = -1
+        )
 
 
 class A2CAlgorithm(RLAlgorithm):
@@ -877,8 +910,22 @@ class A2CAlgorithm(RLAlgorithm):
     ) -> th.nn.Module:
         """Construct one deterministic actor network."""
 
+        # PARAMETER-SHARING
+        # component 7: actor input
+        config = self.learning_config.parameter_sharing
+        if (
+            self.conditioning_registry.context_dim > 0
+            and config.context_architecture != "concatenation"
+        ):
+            raise NotImplementedError("")
+        if (
+            self.conditioning_registry.context_dim > 0
+            and self.learning_config.actor_architecture != "mlp"
+        ):
+            raise NotImplementedError("")
+
         return self.actor_architecture_class(
-            obs_dim = self.obs_dim,
+            obs_dim = self.actor_input_dim,
             act_dim = self.act_dim,
             float_type = self.float_type,
             unique_obs_dim = self.unique_obs_dim,
@@ -1022,6 +1069,40 @@ class A2CAlgorithm(RLAlgorithm):
                 "members": list(member_ids),
                 "checkpoint": f"actor_group_{index}.pt"
             }
+        # PARAMETER-SHARING
+        # component 7: actor input
+        conditioning = {
+            "method": config.conditioning_method,
+            "context_architecture": config.context_architecture,
+            "context_dim": self.conditioning_registry.context_dim,
+            "feature_names": list(
+                self.conditioning_registry.feature_names
+            ),
+            "unit_to_vector": {
+                unit_id: list(vector)
+                for unit_id, vector in (
+                    self.conditioning_registry
+                    .unit_to_vector
+                    .items()
+                )
+            },
+            "numeric_bounds": {
+                feature_name: list(bounds)
+                for feature_name, bounds in (
+                    self.conditioning_registry
+                    .numeric_bounds
+                    .items()
+                )
+            },
+            "categorical_values": {
+                feature_name: list(values)
+                for feature_name, values in (
+                    self.conditioning_registry
+                    .categorical_values
+                    .items()
+                )
+            },
+        }
         return {
             "schema_version": 1,
             "algorithm": self.learning_config.algorithm,
@@ -1034,5 +1115,6 @@ class A2CAlgorithm(RLAlgorithm):
             "unit_to_actor_group": dict(
                 self.actor_group_registry.unit_to_group
             ),
+            "conditioning": conditioning,
             "groups": groups
         }

@@ -114,7 +114,10 @@ class PPO(A2CAlgorithm):
         policy provides sufficient exploration from the very first episode.
         """
         if strategy.learning_mode and not strategy.evaluation_mode:
-            action, log_prob = strategy.actor.get_action_and_log_prob(obs.unsqueeze(0))
+            # PARAMETER-SHARING
+            # component 7: actor input
+            actor_input = self.prepare_actor_input(strategy.unit_id, obs.unsqueeze(0))
+            action, log_prob = strategy.actor.get_action_and_log_prob(actor_input)
             action = action.squeeze(0).detach()
             # Cache log-prob for rollout buffer; value is recomputed centrally
             strategy._last_log_prob = log_prob.squeeze(0).detach()
@@ -122,7 +125,10 @@ class PPO(A2CAlgorithm):
             return action, noise
 
         # Evaluation
-        action = strategy.actor(obs, deterministic=True).detach()
+        # PARAMETER-SHARING
+        # component 7: actor input
+        actor_input = self.prepare_actor_input(strategy.unit_id, obs)
+        action = strategy.actor(actor_input, deterministic=True).detach()
         noise = th.zeros_like(action, dtype=strategy.float_type)
         return action, noise
 
@@ -399,8 +405,11 @@ class PPO(A2CAlgorithm):
                     ) / (
                         advantages_flat.std() + 1e-8
                     )
+                    # PARAMETER-SHARING
+                    # component 7: actor input
+                    actor_input_i = self.prepare_actor_input(unit_id, obs_i)
                     log_probs, entropy = actor.evaluate_actions(
-                        obs_i,
+                        actor_input_i,
                         actions_i,
                     )
                     values = critic(all_states).flatten()
@@ -563,9 +572,20 @@ class PPO(A2CAlgorithm):
     ) -> th.nn.Module:
         """Construct a MAPPO stochastic actor network."""
         actor_architecture = self.learning_config.on_policy.actor_architecture
+        config = self.learning_config.parameter_sharing
+        if (
+            self.conditioning_registry.context_dim > 0
+            and config.context_architecture != "concatenation"
+        ):
+            raise NotImplementedError("MAPPO contextual actors currently support only concatenation.")
+        if (
+            self.conditioning_registry.context_dim > 0
+            and actor_architecture != "mlp"
+        ):
+            raise NotImplementedError("MAPPO contextual actors currently support only the MLP architecture.")
         if actor_architecture == "lstm":
             return LSTMActorPPO(
-                obs_dim = self.obs_dim,
+                obs_dim = self.actor_input_dim,
                 act_dim = self.act_dim,
                 float_type = self.float_type,
                 unique_obs_dim = self.unique_obs_dim,
@@ -574,7 +594,7 @@ class PPO(A2CAlgorithm):
                 )
             ).to(self.device)
         return ActorPPO(
-            obs_dim = self.obs_dim,
+            obs_dim = self.actor_input_dim,
             act_dim = self.act_dim,
             float_type = self.float_type
         ).to(self.device)
