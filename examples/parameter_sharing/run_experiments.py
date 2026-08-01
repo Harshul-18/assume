@@ -35,6 +35,7 @@ from sqlalchemy import create_engine
 
 EXAMPLES_DIRECTORY = Path(__file__).resolve().parents[1]
 INPUTS_PATH = EXAMPLES_DIRECTORY / "inputs"
+PARAMETER_SHARING_DIRECTORY = Path(__file__).resolve().parent
 
 EXAMPLE_NAME = "example_02b"
 STUDY_CASE = "base"
@@ -57,7 +58,9 @@ EXAMPLES = (
 TRAINING_EPISODES = 50
 SEEDS = (11, 22, 33, 44, 55, 66, 77, 88, 99, 110)
 
-REFERENCE_PRICE_DIRECTORY: Path | None = None
+REFERENCE_PRICE_DIRECTORY = (
+    PARAMETER_SHARING_DIRECTORY / "reference_prices"
+)
 
 EXPERIMENT_DIRECTORY = (
     OUTPUT_DIRECTORY / "parameter_sharing_experiments"
@@ -1627,8 +1630,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--reference-price-directory",
         type=Path,
-        required=True,
-        help="Directory containing prices_<scenario>.csv files",
+        default=REFERENCE_PRICE_DIRECTORY,
+        help=(
+            "Directory containing prices_<scenario>.csv files "
+            f"(default: {REFERENCE_PRICE_DIRECTORY})"
+        ),
     )
     parser.add_argument(
         "--output-directory",
